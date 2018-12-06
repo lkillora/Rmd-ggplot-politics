@@ -1,0 +1,263 @@
+---
+title: "Crime in Europe in 2015"
+output:
+  html_document: default
+  pdf_document: default
+  word_document: default
+---
+```{r download, include=FALSE}
+library(dplyr)
+library(reshape2)
+library(ggplot2)
+library(rgdal) # used to read world map data
+library(rgeos) # to fortify without needing gpclib
+library(maptools)
+library(scales) # for formatting ggplot scales with commas
+library(eurostat)
+library(corrplot)
+
+crime <- read.csv(file="./EurostatCrime2015.csv", header=TRUE, sep=",")
+crime <- crime %>% mutate(Sex.crime = Rape + Sexual.assault + Sexual.violence) %>% select(-Rape, -Sexual.assault, -Sexual.violence)
+crime <- crime[complete.cases(crime),]
+crime <- crime %>% mutate(rank_by_rank = 0, rank_by_proportion = 0, sum_crimes = 0)
+for (col in names(crime)[2:6]){
+  crime <- crime %>% arrange(eval(parse(text=col))) %>%
+    mutate(rank_by_rank = rank_by_rank + row_number(eval(parse(text=col))),
+           rank_by_proportion = rank_by_proportion + eval(parse(text=paste0(col,"/sum(",col,")"))),
+           sum_crimes = sum_crimes + eval(parse(text=col)))
+  crime[,ncol(crime)+1] <- row_number(eval(parse(text=paste("crime$",col))))
+  names(crime)[ncol(crime)] <- paste0("rank_",col)
+}
+crime <- crime %>% mutate(rank_by_rank = rank_by_rank/5,
+                          rank_by_proportion = rank_by_proportion/5)
+                          
+
+# MAP 1
+crime <- crime %>% dplyr::rename(country = X)
+crime$country = as.character(crime$country)
+crime <- crime %>% rename(Intentional_Homicide = Intentional.homicide,
+                          Sex_Crime = Sex.crime,
+                          Crime_Score = rank_by_proportion,
+                          Crime_Rank = rank_by_rank,
+                          Total_Crimes = sum_crimes)
+countries <- crime %>% select(country)
+countries <- as.vector(countries$country)
+
+# Data from http://thematicmapping.org/downloads/world_borders.php.
+# Direct link: http://thematicmapping.org/downloads/TM_WORLD_BORDERS_SIMPL-0.3.zip
+# Unpack and put the files in a dir 'data'
+worldMap <- readOGR(dsn="./TM_WORLD_BORDERS_SIMPL-0.3",
+                    layer="TM_WORLD_BORDERS_SIMPL-0.3")
+worldMap.fort <- fortify(worldMap, region = "ISO3")
+
+#'for (c in countries){
+#  print(c==worldMap@data[which(worldMap@data[,"NAME"]==c),"NAME"])
+#}
+# doesn't have Northern Ireland
+
+id <- worldMap@data$ISO3
+name <- worldMap@data$NAME
+centroids.df <- as.data.frame(coordinates(worldMap))
+names(centroids.df) <- c("Longitude", "Latitude")  #more sensible column names
+basic <- data.frame(id = id, country=name, centroids.df)
+basic$id = as.character(basic$id)
+basic$country = as.character(basic$country)
+locations <- basic %>% left_join(crime,by="country")
+bounds <- basic %>% inner_join(crime,by="country")
+```
+
+### Total Crimes
+```{r tot_crimes, echo=FALSE}
+# Total Crimes
+ggplot(locations, aes(map_id = id)) +
+  geom_map(aes(fill = Total_Crimes), colour= "grey", map = worldMap.fort) +
+  expand_limits(x = worldMap.fort$long, y = worldMap.fort$lat) +
+  scale_fill_gradient(high = "red", low = "white", guide = "colorbar", 
+                      labels = comma, name="Crimes") +
+  geom_text(aes(label = id, x = Longitude, y = Latitude), 
+            data = locations[complete.cases(locations),], size=1.9) + 
+  coord_equal(xlim = c(min(bounds$Longitude)-2,max(bounds$Longitude)+2), 
+              ylim = c(min(bounds$Latitude)-4,max(bounds$Latitude))+4.5) + 
+  labs(x = "Longitude", y = "Latitude", title = "Total Crimes (per 1,000 Inhabitants) in 2015, Split by Country") +
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        legend.title = element_text(size=10),
+        legend.text = element_text(size=8, face = "italic"),
+        axis.text.y = element_blank(), axis.ticks.x = element_blank(),
+        axis.ticks.y = element_blank(), axis.title = element_blank())
+```
+
+### Correlation Plot
+```{r corr, echo=FALSE}
+# Correlation Plot
+corrmatrix=cor(crime[2:6], use="complete.obs")
+rownames(corrmatrix) <- c("Assault", "Homicide", "Robbery", "Theft", "Sex Crime")
+colnames(corrmatrix) <- rownames(corrmatrix)
+for (i in 1:length(colnames(corrmatrix))){
+  colnames(corrmatrix)[i] = paste0(colnames(corrmatrix)[i],"                          ")
+}
+corrplot(corrmatrix, method="square", tl.pos="lt", type="upper",        
+tl.col="black", tl.cex=1,tl.srt=45,addCoef.col="black", addCoefasPercent = TRUE, p.mat = 1-abs(corrmatrix), 
+sig.level=0.50, insig = "blank",mar=c(0,0,1,0), diag=TRUE, cl.ratio = 0.25) 
+```
+
+Surprisingly the crimes are not very correlated with each other. The only significant correlations (i.e. with a correlation coefficient less than -0.5 or greater than 0.5) being between Assault & Robbery and Theft & Sex Crime.
+
+```{r eurostat, include=FALSE}
+query <- search_eurostat("age",type="table")
+query[1:20,1:2]
+pop <- get_eurostat(id="tps00010", time_format="num")
+pop <- label_eurostat(pop)
+pop <- pop %>% filter(time==2015) %>% filter(indic_de=="Proportion of population aged 15-24 years") %>%
+  rename(country = geo, fifteen_twentyfour = values) %>% select(-indic_de,-time)
+pop$country <- as.character(pop$country)
+pop <- pop %>% mutate(country = ifelse(grepl('Germany', country),"Germany",country))
+
+query <- search_eurostat("unemployment",type="table")
+query[1:20,1:2]
+# total unemployment rate
+unemployment <- get_eurostat(id="tps00203", time_format="num")
+unemployment <- label_eurostat(unemployment)
+unemployment <- unemployment %>% filter(time=="2015") %>%
+  filter(unit=="Percentage of total population") %>% select(-age, -sex, -unit, -time) %>%
+  rename(unemployment_rate = values, country = geo)
+unemployment$country <- as.character(unemployment$country)
+unemployment <- unemployment %>% mutate(country = ifelse(grepl('Germany', country),"Germany",country))
+
+query <- search_eurostat("debt",type="table")
+query[1:27,1:2] %>% print(n=27)
+house_debt <- get_eurostat(id="tec00104", time_format="num")
+house_debt <- label_eurostat(house_debt)
+house_debt <- house_debt %>% filter(time=="2015") %>%
+  select(-unit, -na_item, -sector, -time) %>%
+  rename(debt_to_inc = values, country = geo)
+house_debt$country <- as.character(house_debt$country)
+house_debt <- house_debt %>% mutate(country = ifelse(grepl('Germany', country),"Germany",country))
+
+crime2 <- crime %>% select("country","Assault","Intentional_Homicide",
+                 "Robbery","Theft","Sex_Crime")
+crime2 <- melt(crime2,id.vars = "country") %>% left_join(unemployment,by="country") %>% 
+  left_join(house_debt,by="country") %>% left_join(pop,by="country")
+crime_exc_theft <- crime2 %>% filter(variable!="Theft")
+theft <- crime2 %>% filter(variable=="Theft")
+
+theft <- theft %>% mutate(fifteen_twentyfour = fifteen_twentyfour/100,
+                          debt_to_inc = debt_to_inc/100)
+```
+
+### Bubble Plot
+```{r bubble plot, echo=FALSE}
+ggplot(data = theft) +
+  geom_point(mapping = aes(x = debt_to_inc, y = fifteen_twentyfour, size=value, colour=value)) +
+  scale_color_gradient2(low = "white", midpoint = 2000, mid = "orange", high = "red",limits=c(0, 4200), breaks=seq(0, 4200, by=1000)) +
+  guides(color= guide_legend(), size=guide_legend()) +
+  scale_size_continuous(limits=c(0, 4200), breaks=seq(0, 4200, by=1000)) +
+  labs(y = "Population Aged 15-24", x = "Debt to Income Ratio of Households", title = "Thefts per 1,000 Inhabitants in 2015") +
+  scale_x_continuous(labels=percent) +
+  scale_y_continuous(labels=percent) +
+  theme_bw()
+```
+
+Some other Eurostat data indicates that thefts tend to be more prevalent amongest countries with a higher proportion of young people (15 - 24 year olds), as well as ones with more strenuous household debt burdens. The same is not true for the other crimes.
+
+### Plot For Each Crime Type
+```{r breakdown1, echo=FALSE}
+# Assaults
+locations <- locations[complete.cases(locations),]
+ggplot(locations, aes(map_id = id)) +
+  geom_map(aes(fill = Assault), colour= "grey", map = worldMap.fort) +
+  expand_limits(x = worldMap.fort$long, y = worldMap.fort$lat) +
+  scale_fill_gradient(high = "red", low = "white", guide = "colorbar", 
+                      labels = comma, name="Assaults") +
+  geom_text(aes(label = id, x = Longitude, y = Latitude), 
+            data = locations[complete.cases(locations),], size=1.9) + 
+  coord_equal(xlim = c(min(bounds$Longitude)-2,max(bounds$Longitude)+2), 
+              ylim = c(min(bounds$Latitude)-4,max(bounds$Latitude))+4.5) + 
+  labs(x = "Longitude", y = "Latitude", title = "Assaults per 1,000 Inhabitants in 2015, Split by Country") +
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        legend.title = element_text(size=10),
+        legend.text = element_text(size=8, face = "italic"),
+        axis.text.y = element_blank(), axis.ticks.x = element_blank(),
+        axis.ticks.y = element_blank(), axis.title = element_blank())
+```
+
+```{r breakdown2, echo=FALSE}
+# Intentional Homicide
+ggplot(locations, aes(map_id = id)) +
+  geom_map(aes(fill = Intentional_Homicide), colour= "grey", map = worldMap.fort) +
+  expand_limits(x = worldMap.fort$long, y = worldMap.fort$lat) +
+  scale_fill_gradient(high = "red", low = "white", guide = "colorbar", 
+                      labels = comma, name="Homicides") +
+  geom_text(aes(label = id, x = Longitude, y = Latitude), 
+            data = locations[complete.cases(locations),], size=1.9) + 
+  coord_equal(xlim = c(min(bounds$Longitude)-2,max(bounds$Longitude)+2), 
+              ylim = c(min(bounds$Latitude)-4,max(bounds$Latitude))+4.5) + 
+  labs(x = "Longitude", y = "Latitude", title = "Intentional Homicides per 1,000 Inhabitants in 2015, Split by Country") +
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        legend.title = element_text(size=10),
+        legend.text = element_text(size=8, face = "italic"),
+        axis.text.y = element_blank(), axis.ticks.x = element_blank(),
+        axis.ticks.y = element_blank(), axis.title = element_blank())
+```
+
+```{r breakdown3, echo=FALSE}
+# Robbery
+ggplot(locations, aes(map_id = id)) +
+  geom_map(aes(fill = Robbery), colour= "grey", map = worldMap.fort) +
+  expand_limits(x = worldMap.fort$long, y = worldMap.fort$lat) +
+  scale_fill_gradient(high = "red", low = "white", guide = "colorbar", 
+                      labels = comma, name="Robberies") +
+  geom_text(aes(label = id, x = Longitude, y = Latitude), 
+            data = locations[complete.cases(locations),], size=1.9) + 
+  coord_equal(xlim = c(min(bounds$Longitude)-2,max(bounds$Longitude)+2), 
+              ylim = c(min(bounds$Latitude)-4,max(bounds$Latitude))+4.5) + 
+  labs(x = "Longitude", y = "Latitude", title = "Robberies per 1,000 Inhabitants in 2015, Split by Country") +
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        legend.title = element_text(size=10),
+        legend.text = element_text(size=8, face = "italic"),
+        axis.text.y = element_blank(), axis.ticks.x = element_blank(),
+        axis.ticks.y = element_blank(), axis.title = element_blank())
+```
+
+```{r breakdown4, echo=FALSE}
+# Theft
+ggplot(locations, aes(map_id = id)) +
+  geom_map(aes(fill = Theft), colour= "grey", map = worldMap.fort) +
+  expand_limits(x = worldMap.fort$long, y = worldMap.fort$lat) +
+  scale_fill_gradient(high = "red", low = "white", guide = "colorbar", 
+                      labels = comma, name="Thefts") +
+  geom_text(aes(label = id, x = Longitude, y = Latitude), 
+            data = locations[complete.cases(locations),], size=1.9) + 
+  coord_equal(xlim = c(min(bounds$Longitude)-2,max(bounds$Longitude)+2), 
+              ylim = c(min(bounds$Latitude)-4,max(bounds$Latitude))+4.5) + 
+  labs(x = "Longitude", y = "Latitude", title = "Thefts per 1,000 Inhabitants in 2015, Split by Country") +
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        legend.title = element_text(size=10),
+        legend.text = element_text(size=8, face = "italic"),
+        axis.text.y = element_blank(), axis.ticks.x = element_blank(),
+        axis.ticks.y = element_blank(), axis.title = element_blank())
+```
+
+```{r breakdown5, echo=FALSE}
+# Sex Crime
+ggplot(locations, aes(map_id = id)) +
+  geom_map(aes(fill = Sex_Crime), colour= "grey", map = worldMap.fort) +
+  expand_limits(x = worldMap.fort$long, y = worldMap.fort$lat) +
+  scale_fill_gradient(high = "red", low = "white", guide = "colorbar", 
+                      labels = comma, name="Cases") +
+  geom_text(aes(label = id, x = Longitude, y = Latitude), 
+            data = locations[complete.cases(locations),], size=1.9) + 
+  coord_equal(xlim = c(min(bounds$Longitude)-2,max(bounds$Longitude)+2), 
+              ylim = c(min(bounds$Latitude)-4,max(bounds$Latitude))+4.5) + 
+  labs(x = "Longitude", y = "Latitude", title = "Sex Crime Incidents per 1,000 Inhabitants in 2015, Split by Country") +
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        legend.title = element_text(size=10),
+        legend.text = element_text(size=8, face = "italic"),
+        axis.text.y = element_blank(), axis.ticks.x = element_blank(),
+        axis.ticks.y = element_blank(), axis.title = element_blank())
+```
